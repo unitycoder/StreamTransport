@@ -52,6 +52,11 @@ namespace Transport {
       throw new AssertException();
     }
 
+    
+    public static void AlwaysFail(string message) {
+      throw new AssertException(message);
+    }
+    
     public static void Always(bool condition) {
       if (condition == false) {
         throw new AssertException();
