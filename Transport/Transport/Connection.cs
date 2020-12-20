@@ -19,6 +19,12 @@ namespace Transport {
     public int    ConnectionAttempts;
     public double ConnectionAttemptTime;
 
+    // 
+    public double LastSentPacketTime;
+    public double LastRecvPacketTime;
+
+    public double DisconnectTime;
+
     public Connection(IPEndPoint remoteEndPoint) {
       State = ConnectionState.Created;
 
@@ -30,9 +36,13 @@ namespace Transport {
         case ConnectionState.Connected:
           Assert.Check(State == ConnectionState.Created || State == ConnectionState.Connecting);
           break;
-        
+
         case ConnectionState.Connecting:
           Assert.Check(State == ConnectionState.Created);
+          break;
+        
+        case ConnectionState.Disconnected:
+          Assert.Check(State == ConnectionState.Connected);
           break;
       }
 

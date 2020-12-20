@@ -29,6 +29,11 @@ namespace Transport {
       get => ElapsedInTicks / (double) Stopwatch.Frequency;
     }
 
+    public double Now {
+      [MethodImpl(MethodImplOptions.AggressiveInlining)]
+      get => ElapsedInSeconds;
+    }
+
     public bool IsRunning {
       [MethodImpl(MethodImplOptions.AggressiveInlining)]
       get => _running == 1;

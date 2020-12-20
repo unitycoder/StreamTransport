@@ -5,20 +5,35 @@ using System.Threading;
 
 namespace Transport {
   class TestPeer {
-    public const ushort SERVER_PORT = 25000;
+    public const ushort SERVER_PORT = 25005;
 
     public static IPEndPoint ServerEndPoint => new IPEndPoint(IPAddress.Loopback, SERVER_PORT);
 
     bool _server;
-    
+
     public Peer Peer;
 
+    public bool IsServer => _server;
+    public bool IsClient => _server == false;
+    
     public TestPeer(bool server) {
       _server = server;
       Peer    = new Peer(GetConfig(server));
+      Peer.OnConnected += PeerOnConnected;
+      Peer.OnUnreliablePacket += PeerOnUnreliablePacket;
 
-      if (_server == false) {
+      if (IsClient) {
         Peer.Connect(ServerEndPoint);
+      }
+    }
+
+    void PeerOnUnreliablePacket(Connection connection, Packet packet) {
+      Log.Trace($"Got Data: {BitConverter.ToUInt32(packet.Data, packet.Offset)}"); 
+    }
+
+    void PeerOnConnected(Connection connection) {
+      if (IsClient) {
+        Peer.SendUnreliable(connection, BitConverter.GetBytes(uint.MaxValue));
       }
     }
 
@@ -36,7 +51,7 @@ namespace Transport {
     }
 
     public void Update() {
-      Peer.Update();
+      Peer?.Update();
     }
   }
 
@@ -45,7 +60,7 @@ namespace Transport {
 
     static void Main(string[] args) {
       Log.InitForConsole();
-      
+
       Peers.Add(new TestPeer(true));
       Peers.Add(new TestPeer(false));
 

@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 
@@ -12,6 +13,12 @@ namespace Transport {
 
     public Config Config => _config;
 
+    public event Action<Connection, ConnectionFailedReason> OnConnectionFailed;
+    public event Action<Connection>                         OnConnected;
+    public event Action<Connection, DisconnectedReason>     OnDisconnected;
+    
+    public event Action<Connection, Packet>                 OnUnreliablePacket;
+
     public Peer(Config config) {
       _config = config;
       _clock  = Timer.StartNew();
@@ -21,8 +28,32 @@ namespace Transport {
       _socket          = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
       _socket.Blocking = false;
       _socket.Bind(config.EndPoint);
+      
+      Log.Info($"Socket Bound To {_socket.LocalEndPoint}");
 
       SetConnReset(_socket);
+    }
+
+    public void SendUnreliable(Connection connection, byte[] data) {
+      if (data.Length > (_config.Mtu - 1)) {
+        Log.Error($"Data to large, above MTU-1: {data.Length}");
+        return;
+      }
+
+      var buffer = GetMtuBuffer();
+      Buffer.BlockCopy(data, 0, buffer, 1, data.Length);
+      buffer[0] = (byte) PacketType.Unreliable;
+      
+      Send(connection, buffer, data.Length + 1);
+    }
+
+    public void Disconnect(Connection connection) {
+      if (connection.State != ConnectionState.Connected) {
+        Log.Error($"Can't disconnect {connection} state is {connection.State}");
+        return;
+      }
+
+      DisconnectConnection(connection, DisconnectedReason.RequestedByPeer);
     }
 
     public void Connect(IPEndPoint endpoint) {
@@ -37,7 +68,7 @@ namespace Transport {
       UpdateConnections();
     }
 
-    public void SendUnconnected(byte[] data, EndPoint target) {
+    public void SendUnconnected(EndPoint target, byte[] data) {
       _socket.SendTo(data, target);
     }
 
@@ -52,7 +83,37 @@ namespace Transport {
         case ConnectionState.Connecting:
           UpdateConnecting(connection);
           break;
+
+        case ConnectionState.Connected:
+          UpdateConnected(connection);
+          break;
+
+        case ConnectionState.Disconnected:
+          UpdateDisconnected(connection);
+          break;
       }
+    }
+
+    void UpdateDisconnected(Connection connection) {
+      if ((connection.DisconnectTime + _config.DisconnectIdleTime) < _clock.ElapsedInSeconds) {
+        RemoveConnection(connection);
+      }
+    }
+
+    void UpdateConnected(Connection connection) {
+      if ((connection.LastRecvPacketTime + _config.ConnectionTimeout) < _clock.ElapsedInSeconds) {
+        DisconnectConnection(connection, DisconnectedReason.Timeout);
+      }
+    }
+
+    void DisconnectConnection(Connection connection, DisconnectedReason reason, bool sendToOtherPeer = true) {
+      if (sendToOtherPeer) {
+        SendCommand(connection, Commands.Disconnect, (byte) reason);
+      }
+
+      connection.ChangeState(ConnectionState.Disconnected);
+      connection.DisconnectTime = _clock.ElapsedInSeconds;
+      OnDisconnected?.Invoke(connection, reason);
     }
 
     void UpdateConnecting(Connection connection) {
@@ -87,20 +148,37 @@ namespace Transport {
           Length = bytesReceived
         };
 
-        Log.Trace($"received {bytesReceived} from {endpoint}");
+        Log.Trace($"Received {bytesReceived} Bytes From {endpoint}");
 
         var ipEndpoint = (IPEndPoint) endpoint;
 
         if (_connections.TryGetValue(ipEndpoint, out var connection)) {
-          switch ((PacketType) packet.Data[0]) {
-            case PacketType.Command:
-              HandleCommandPacket(connection, packet);
-              break;
+          if (connection.State != ConnectionState.Disconnected) {
+            HandleConnectedPacket(connection, packet);
           }
         } else {
           HandleUnconnectedPacket(ipEndpoint, packet);
         }
       }
+    }
+
+    void HandleConnectedPacket(Connection connection, Packet packet) {
+      connection.LastRecvPacketTime = _clock.ElapsedInSeconds;
+
+      switch ((PacketType) packet.Data[0]) {
+        case PacketType.Command:
+          HandleCommandPacket(connection, packet);
+          break;
+        
+        case PacketType.Unreliable:
+          HandleUnreliablePacket(connection, packet);
+          break;
+      }
+    }
+
+    void HandleUnreliablePacket(Connection connection, Packet packet) {
+      packet.Offset = 1;
+      OnUnreliablePacket?.Invoke(connection, packet);
     }
 
     void HandleUnconnectedPacket(IPEndPoint endpoint, Packet packet) {
@@ -119,8 +197,14 @@ namespace Transport {
         return;
       }
 
+      // we know packet is valid ... but we don't have enough connection slots
       if (_connections.Count >= _config.MaxConnections) {
-        // TODO: Send "connection refused server is full packet" as a reply...
+        SendUnconnected(endpoint, new byte[3] {
+          (byte) PacketType.Command,
+          (byte) Commands.ConnectionRefused,
+          (byte) ConnectionFailedReason.ServerFull
+        });
+
         return;
       }
 
@@ -130,7 +214,9 @@ namespace Transport {
 
     Connection CreateConnection(IPEndPoint endpoint) {
       Connection connection;
-      connection = new Connection(endpoint);
+
+      connection                    = new Connection(endpoint);
+      connection.LastRecvPacketTime = _clock.ElapsedInSeconds;
 
       _connections.Add(endpoint, connection);
 
@@ -139,7 +225,16 @@ namespace Transport {
       return connection;
     }
 
+    void RemoveConnection(Connection connection) {
+      Assert.Check(connection.State != ConnectionState.Destroyed);
+      var removed = _connections.Remove(connection.RemoteEndPoint);
+      connection.ChangeState(ConnectionState.Destroyed);
+      Assert.Check(removed);
+    }
+
     void HandleCommandPacket(Connection connection, Packet packet) {
+      Log.Trace($"Received Command {(Commands) packet.Data[1]} From {connection}");
+
       switch ((Commands) packet.Data[1]) {
         case Commands.ConnectRequest:
           HandleConnectRequest(connection, packet);
@@ -148,13 +243,44 @@ namespace Transport {
         case Commands.ConnectionAccepted:
           HandleConnectionAccepted(connection, packet);
           break;
+
+        case Commands.ConnectionRefused:
+          HandleConnectionRefused(connection, packet);
+          break;
+
+        case Commands.Disconnect:
+          HandleDisconnected(connection, packet);
+          break;
+
+        default:
+          Log.Info($"Unknown Command: {(Commands) packet.Data[1]}");
+          break;
+      }
+    }
+
+    void HandleDisconnected(Connection connection, Packet packet) {
+      DisconnectConnection(connection, (DisconnectedReason) packet.Data[3], false);
+    }
+
+    void HandleConnectionRefused(Connection connection, Packet packet) {
+      switch (connection.State) {
+        case ConnectionState.Connecting:
+          var reason = (ConnectionFailedReason) packet.Data[2];
+          Log.Trace($"Connection Refused: {reason}");
+          RemoveConnection(connection);
+          OnConnectionFailed?.Invoke(connection, reason);
+          break;
+
+        default:
+          Assert.AlwaysFail();
+          break;
       }
     }
 
     void HandleConnectRequest(Connection connection, Packet packet) {
       switch (connection.State) {
         case ConnectionState.Created:
-          connection.ChangeState(ConnectionState.Connected);
+          SetConnectionAsConnected(connection);
           SendCommand(connection, Commands.ConnectionAccepted);
           break;
 
@@ -179,18 +305,38 @@ namespace Transport {
           break;
 
         case ConnectionState.Connecting:
-          connection.ChangeState(ConnectionState.Connected);
+          SetConnectionAsConnected(connection);
           break;
       }
     }
 
-    void SendCommand(Connection connection, Commands command) {
-      Log.Trace($"Sending command {command} to {connection}");
-      Send(connection, new byte[2] {(byte) PacketType.Command, (byte) command});
+    void SetConnectionAsConnected(Connection connection) {
+      connection.ChangeState(ConnectionState.Connected);
+      OnConnected?.Invoke(connection);
     }
 
-    void Send(Connection connection, byte[] data) {
-      _socket.SendTo(data, connection.RemoteEndPoint);
+    void SendCommand(Connection connection, Commands command, byte? commandData = null) {
+      Assert.Check(connection.State < ConnectionState.Disconnected);
+
+      Log.Trace($"Sending Command {command} To {connection}");
+
+      if (commandData.HasValue) {
+        Send(connection, new byte[3] {(byte) PacketType.Command, (byte) command, commandData.Value});
+      } else {
+        Send(connection, new byte[2] {(byte) PacketType.Command, (byte) command});
+      }
+    }
+
+    void Send(Connection connection, byte[] data, int? length = null) {
+      Assert.Check(connection.State < ConnectionState.Disconnected);
+
+      connection.LastSentPacketTime = _clock.ElapsedInSeconds;
+
+      if (length.HasValue) {
+        _socket.SendTo(data, 0, length.Value, SocketFlags.None, connection.RemoteEndPoint);
+      } else {
+        _socket.SendTo(data, connection.RemoteEndPoint);
+      }
     }
 
 
