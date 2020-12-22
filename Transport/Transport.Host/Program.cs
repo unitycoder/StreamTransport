@@ -33,7 +33,7 @@ namespace Transport {
 
     void PeerOnConnected(Connection connection) {
       if (IsClient) {
-        Peer.SendUnreliable(connection, BitConverter.GetBytes(uint.MaxValue));
+        Peer.SendNotify(connection, BitConverter.GetBytes(uint.MaxValue), null);
       }
     }
 
@@ -61,14 +61,18 @@ namespace Transport {
     static void Main(string[] args) {
       Log.InitForConsole();
 
+      //Sequencer sequencer = new Sequencer(1);
+      // ... 254 255 0 1 2 3 ... 
+      //Log.Info(sequencer.Distance(255, 0));
+      
       Peers.Add(new TestPeer(true));
       Peers.Add(new TestPeer(false));
-
+      
       while (true) {
         for (int i = 0; i < Peers.Count; ++i) {
           Peers[i].Update();
         }
-
+      
         Thread.Sleep(15);
       }
 

@@ -16,7 +16,6 @@ namespace Transport {
     public event Action<Connection, ConnectionFailedReason> OnConnectionFailed;
     public event Action<Connection>                         OnConnected;
     public event Action<Connection, DisconnectedReason>     OnDisconnected;
-    
     public event Action<Connection, Packet>                 OnUnreliablePacket;
 
     public Peer(Config config) {
@@ -28,7 +27,7 @@ namespace Transport {
       _socket          = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
       _socket.Blocking = false;
       _socket.Bind(config.EndPoint);
-      
+
       Log.Info($"Socket Bound To {_socket.LocalEndPoint}");
 
       SetConnReset(_socket);
@@ -42,9 +41,58 @@ namespace Transport {
 
       var buffer = GetMtuBuffer();
       Buffer.BlockCopy(data, 0, buffer, 1, data.Length);
-      buffer[0] = (byte) PacketType.Unreliable;
-      
+      buffer[0] = (byte) PacketTypes.Unreliable;
+
       Send(connection, buffer, data.Length + 1);
+    }
+
+    public bool SendNotify(Connection connection, byte[] data, object userObject) {
+      if (connection.SendWindow.IsFull) {
+        return false;
+      }
+
+      // 1: packet type enum                      - 1 byte
+      // 2: sequence number for this packet       - _config.SequenceNumberBytes bytes
+      // 3: recv sequence                         - _config.SequenceNumberBytes bytes
+      // 4: recv mask                             - 8 bytes
+
+      var headerSize = 9 + (_config.SequenceNumberBytes * 2);
+
+      if (data.Length > (_config.Mtu - headerSize)) {
+        throw new InvalidOperationException();
+      }
+
+      var sequenceNumberForPacket = connection.SendSequencer.Next();
+
+      var buffer = GetMtuBuffer();
+      
+      // copy from data into buffer
+      Buffer.BlockCopy(data, 0, buffer, headerSize, data.Length);
+
+      // write packet type
+      buffer[0] = (byte) PacketTypes.Notify;
+      var offset = 1;
+
+      // write sequence number of *this* packet
+      ByteUtils.WriteULong(buffer, offset, _config.SequenceNumberBytes, sequenceNumberForPacket);
+      offset += _config.SequenceNumberBytes;
+
+      // write *recv sequence* for this connection
+      ByteUtils.WriteULong(buffer, offset, _config.SequenceNumberBytes, connection.RecvSequence);
+      offset += _config.SequenceNumberBytes;
+
+      // write *recv mask* for this connection
+      ByteUtils.WriteULong(buffer, offset, 8, connection.RecvMask);
+
+      // push on send window
+      connection.SendWindow.Push(new SendEnvelope {
+        Sequence = sequenceNumberForPacket,
+        Time     = _clock.ElapsedInSeconds,
+        UserData = userObject
+      });
+
+      Send(connection, buffer, headerSize + data.Length);
+      return true;
     }
 
     public void Disconnect(Connection connection) {
@@ -103,6 +151,10 @@ namespace Transport {
     void UpdateConnected(Connection connection) {
       if ((connection.LastRecvPacketTime + _config.ConnectionTimeout) < _clock.ElapsedInSeconds) {
         DisconnectConnection(connection, DisconnectedReason.Timeout);
+      }
+
+      if ((connection.LastSentPacketTime + _config.KeepAliveInterval) < _clock.ElapsedInSeconds) {
+        Send(connection, new byte[1] {(byte) PacketTypes.KeepAlive});
       }
     }
 
@@ -165,13 +217,21 @@ namespace Transport {
     void HandleConnectedPacket(Connection connection, Packet packet) {
       connection.LastRecvPacketTime = _clock.ElapsedInSeconds;
 
-      switch ((PacketType) packet.Data[0]) {
-        case PacketType.Command:
+      switch ((PacketTypes) packet.Data[0]) {
+        case PacketTypes.Command:
           HandleCommandPacket(connection, packet);
           break;
-        
-        case PacketType.Unreliable:
+
+        case PacketTypes.Unreliable:
           HandleUnreliablePacket(connection, packet);
+          break;
+
+        case PacketTypes.KeepAlive:
+          // do nothing
+          break;
+        
+        case PacketTypes.Notify:
+          Log.Trace($"Received Notify Packet");
           break;
       }
     }
@@ -188,7 +248,7 @@ namespace Transport {
       }
 
       // first packet has to be a command
-      if (((PacketType) packet.Data[0]) != PacketType.Command) {
+      if (((PacketTypes) packet.Data[0]) != PacketTypes.Command) {
         return;
       }
 
@@ -200,7 +260,7 @@ namespace Transport {
       // we know packet is valid ... but we don't have enough connection slots
       if (_connections.Count >= _config.MaxConnections) {
         SendUnconnected(endpoint, new byte[3] {
-          (byte) PacketType.Command,
+          (byte) PacketTypes.Command,
           (byte) Commands.ConnectionRefused,
           (byte) ConnectionFailedReason.ServerFull
         });
@@ -215,7 +275,7 @@ namespace Transport {
     Connection CreateConnection(IPEndPoint endpoint) {
       Connection connection;
 
-      connection                    = new Connection(endpoint);
+      connection                    = new Connection(_config, endpoint);
       connection.LastRecvPacketTime = _clock.ElapsedInSeconds;
 
       _connections.Add(endpoint, connection);
@@ -321,9 +381,9 @@ namespace Transport {
       Log.Trace($"Sending Command {command} To {connection}");
 
       if (commandData.HasValue) {
-        Send(connection, new byte[3] {(byte) PacketType.Command, (byte) command, commandData.Value});
+        Send(connection, new byte[3] {(byte) PacketTypes.Command, (byte) command, commandData.Value});
       } else {
-        Send(connection, new byte[2] {(byte) PacketType.Command, (byte) command});
+        Send(connection, new byte[2] {(byte) PacketTypes.Command, (byte) command});
       }
     }
 
