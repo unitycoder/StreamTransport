@@ -8,9 +8,12 @@ namespace Transport {
     public int        MaxConnectAttempts     = 10;
     public int        SequenceNumberBytes    = 2;
     public int        SendWindowSize         = 512;
+    
     public double     ConnectAttemptInterval = 0.25;
     public double     ConnectionTimeout      = 5;
     public double     DisconnectIdleTime     = 2;
     public double     KeepAliveInterval      = 1;
+
+    public double SimulatedLoss = 0;
   }
 }

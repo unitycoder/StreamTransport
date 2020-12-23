@@ -15,5 +15,6 @@ namespace Transport {
   public enum DisconnectedReason : byte {
     Timeout = 1,
     RequestedByPeer = 2,
+    SequenceOutOfBounds = 3,
   }
 }

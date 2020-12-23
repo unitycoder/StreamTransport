@@ -14,7 +14,7 @@ CLIENT: 127.0.0.1:25000 changed state from Connecting to Connected
 namespace Transport {
   public struct SendEnvelope {
     public ulong  Sequence;
-    public double Time;
+    public double SendTime;
     public object UserData;
   }
 
@@ -27,6 +27,8 @@ namespace Transport {
     public double LastSentPacketTime;
     public double LastRecvPacketTime;
     public double DisconnectTime;
+
+    public double Rtt;
 
     // notify fields
 

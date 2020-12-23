@@ -15,6 +15,14 @@ namespace Transport {
       _array = new T[capacity];
     }
 
+    public T Peek() {
+      if (_count == 0) {
+        throw new InvalidOperationException();
+      }
+      
+      return _array[_tail];
+    }
+
     public void Push(T item) {
       if (IsFull) {
         throw new InvalidOperationException();
@@ -26,7 +34,9 @@ namespace Transport {
     }
 
     public T Pop() {
-      Assert.Check(Count > 0);
+      if (_count == 0) {
+        throw new InvalidOperationException();
+      }
       
       var item = _array[_tail];
 

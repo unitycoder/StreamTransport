@@ -8,19 +8,29 @@ namespace Transport {
     Timer  _clock;
     Socket _socket;
     Config _config;
+    Random _random;
 
     Dictionary<IPEndPoint, Connection> _connections;
 
+    const int ACK_MASK_BITS = sizeof(ulong) * 8;
+
+    int NotifyPacketHeaderSize => 9 + (_config.SequenceNumberBytes * 2);
+    
     public Config Config => _config;
 
     public event Action<Connection, ConnectionFailedReason> OnConnectionFailed;
     public event Action<Connection>                         OnConnected;
     public event Action<Connection, DisconnectedReason>     OnDisconnected;
     public event Action<Connection, Packet>                 OnUnreliablePacket;
+    
+    public event Action<Connection, object> OnNotifyPacketLost;
+    public event Action<Connection, object> OnNotifyPacketDelivered;
+    public event Action<Connection, Packet> OnNotifyPacketReceived;
 
     public Peer(Config config) {
       _config = config;
       _clock  = Timer.StartNew();
+      _random = new Random(Environment.TickCount);
 
       _connections = new Dictionary<IPEndPoint, Connection>();
 
@@ -56,18 +66,16 @@ namespace Transport {
       // 3: recv sequence                         - _config.SequenceNumberBytes bytes
       // 4: recv mask                             - 8 bytes
 
-      var headerSize = 9 + (_config.SequenceNumberBytes * 2);
-
-      if (data.Length > (_config.Mtu - headerSize)) {
+      if (data.Length > (_config.Mtu - NotifyPacketHeaderSize)) {
         throw new InvalidOperationException();
       }
 
       var sequenceNumberForPacket = connection.SendSequencer.Next();
 
       var buffer = GetMtuBuffer();
-      
+
       // copy from data into buffer
-      Buffer.BlockCopy(data, 0, buffer, headerSize, data.Length);
+      Buffer.BlockCopy(data, 0, buffer, NotifyPacketHeaderSize, data.Length);
 
       // write packet type
       buffer[0] = (byte) PacketTypes.Notify;
@@ -87,12 +95,85 @@ namespace Transport {
       // push on send window
       connection.SendWindow.Push(new SendEnvelope {
         Sequence = sequenceNumberForPacket,
-        Time     = _clock.ElapsedInSeconds,
+        SendTime     = _clock.ElapsedInSeconds,
         UserData = userObject
       });
 
-      Send(connection, buffer, headerSize + data.Length);
+      Send(connection, buffer, NotifyPacketHeaderSize + data.Length);
       return true;
+    }
+
+    void HandleNotifyPacket(Connection connection, Packet packet) {
+      if (packet.Length < NotifyPacketHeaderSize) {
+        return;
+      }
+      
+      packet.Offset = 1;
+
+      var packetSequenceNumber = ByteUtils.ReadUlong(packet.Data, packet.Offset, _config.SequenceNumberBytes);
+      packet.Offset += _config.SequenceNumberBytes;
+
+      var remoteRecvSequence = ByteUtils.ReadUlong(packet.Data, packet.Offset, _config.SequenceNumberBytes);
+      packet.Offset += _config.SequenceNumberBytes;
+
+      var remoteRecvMask = ByteUtils.ReadUlong(packet.Data, packet.Offset, 8);
+      packet.Offset += 8;
+
+      var sequenceDistance = connection.SendSequencer.Distance(packetSequenceNumber, connection.RecvSequence);
+
+      // sequence is so far out of bounds we can't save, just kick him (or her!)
+      if (Math.Abs(sequenceDistance) > _config.SendWindowSize) { 
+        DisconnectConnection(connection, DisconnectedReason.SequenceOutOfBounds);
+        return;
+      }
+
+      // sequence is old, so duplicate or re-ordered packet
+      if (sequenceDistance <= 0) {
+        return;
+      }
+      
+      // ((sequence_number_bytes * 8) + (ack_mask_bits)): 16 + 64 = 1.25bits
+
+      // update recv sequence for our local connection object
+      connection.RecvSequence = packetSequenceNumber;
+
+      if (sequenceDistance >= ACK_MASK_BITS) {
+        connection.RecvMask = 1; // 0000 0000 0000 0000 0000 0000 0000 0001;
+      } else {
+        connection.RecvMask = (connection.RecvMask << (int)sequenceDistance) | 1;
+      }
+
+      // handle acking
+      AckPackets(connection, remoteRecvSequence, remoteRecvMask);
+      
+      // call out to userland!
+      OnNotifyPacketReceived?.Invoke(connection, packet);
+    }
+
+    void AckPackets(Connection connection, ulong recvSequenceFromRemote, ulong recvMaskFromRemote) {
+      while (connection.SendWindow.Count > 0) {
+        var envelope = connection.SendWindow.Peek();
+
+        var distance = (int)connection.SendSequencer.Distance(envelope.Sequence, recvSequenceFromRemote);
+        if (distance > 0) {
+          break;
+        }
+
+        // remove envelope from send window
+        connection.SendWindow.Pop();
+        
+        // if this is the same as the latest sequence remote received from us, we can use this to calculate RTT 
+        if (distance == 0) {
+          connection.Rtt = _clock.ElapsedInSeconds - envelope.SendTime;
+        }
+
+        // if any of these cases trigger, packet is most likely lost
+        if ((distance <= -ACK_MASK_BITS) || ((recvMaskFromRemote & (1UL << -distance)) == 0UL)) {
+          OnNotifyPacketLost?.Invoke(connection, envelope.UserData);
+        } else {
+          OnNotifyPacketDelivered?.Invoke(connection, envelope.UserData);
+        }
+      }
     }
 
     public void Disconnect(Connection connection) {
@@ -187,29 +268,39 @@ namespace Transport {
     }
 
     void Recv() {
-      if (_socket.Poll(0, SelectMode.SelectRead) == false) {
-        return;
-      }
-
-      var buffer        = GetMtuBuffer();
-      var endpoint      = (EndPoint) new IPEndPoint(IPAddress.Any, 0);
-      var bytesReceived = _socket.ReceiveFrom(buffer, SocketFlags.None, ref endpoint);
-      if (bytesReceived > 0) {
-        var packet = new Packet {
-          Data   = buffer,
-          Length = bytesReceived
-        };
-
-        Log.Trace($"Received {bytesReceived} Bytes From {endpoint}");
-
-        var ipEndpoint = (IPEndPoint) endpoint;
-
-        if (_connections.TryGetValue(ipEndpoint, out var connection)) {
-          if (connection.State != ConnectionState.Disconnected) {
-            HandleConnectedPacket(connection, packet);
+      while (_socket.Poll(0, SelectMode.SelectRead)) {
+        var buffer        = GetMtuBuffer();
+        var endpoint      = (EndPoint) new IPEndPoint(IPAddress.Any, 0);
+        var bytesReceived = _socket.ReceiveFrom(buffer, SocketFlags.None, ref endpoint);
+        if (bytesReceived > 0) {
+          
+          // simulate loss
+          if (_config.SimulatedLoss > 0) {
+            
+            // 0.0-0.1
+            if (_random.NextDouble() < _config.SimulatedLoss) {
+              //Log.Trace($"Simulated Loss Of {bytesReceived} Bytes From {endpoint}");
+              return;
+            }
+            
           }
-        } else {
-          HandleUnconnectedPacket(ipEndpoint, packet);
+
+          var packet = new Packet {
+            Data   = buffer,
+            Length = bytesReceived
+          };
+
+          //Log.Trace($"Received {bytesReceived} Bytes From {endpoint}");
+
+          var ipEndpoint = (IPEndPoint) endpoint;
+
+          if (_connections.TryGetValue(ipEndpoint, out var connection)) {
+            if (connection.State != ConnectionState.Disconnected) {
+              HandleConnectedPacket(connection, packet);
+            }
+          } else {
+            HandleUnconnectedPacket(ipEndpoint, packet);
+          }
         }
       }
     }
@@ -229,12 +320,13 @@ namespace Transport {
         case PacketTypes.KeepAlive:
           // do nothing
           break;
-        
+
         case PacketTypes.Notify:
-          Log.Trace($"Received Notify Packet");
+          HandleNotifyPacket(connection, packet);
           break;
       }
     }
+
 
     void HandleUnreliablePacket(Connection connection, Packet packet) {
       packet.Offset = 1;
